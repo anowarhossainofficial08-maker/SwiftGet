@@ -1,0 +1,166 @@
+name: Build SwiftGet for Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to publish the GitHub Release with the installer
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Install PyInstaller, theme and tray support
+        run: python -m pip install pyinstaller -r requirements.txt
+
+      - name: Build the app (one-folder)
+        run: >
+          pyinstaller --noconfirm --onedir --windowed --name SwiftGet
+          --icon assets/swiftget.ico --add-data "assets/swiftget.ico;assets"
+          --collect-data sv_ttk --hidden-import pystray._win32 run.py
+
+      # Firefox add-on (.xpi). If the repository has the secrets AMO_JWT_ISSUER and
+      # AMO_JWT_SECRET (free API keys from addons.mozilla.org), Mozilla signs it so it can be
+      # installed permanently; otherwise it is unsigned (Firefox "temporary add-on").
+      - name: Build Firefox add-on
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          python tools/build_firefox.py dist/SwiftGet-firefox.xpi
+          if ($env:AMO_JWT_ISSUER -and $env:AMO_JWT_SECRET) {
+            $src = Join-Path $env:RUNNER_TEMP "ffsrc"
+            Expand-Archive dist/SwiftGet-firefox.xpi -DestinationPath $src -Force
+            npx --yes web-ext@8 sign --source-dir $src --channel unlisted `
+              --api-key $env:AMO_JWT_ISSUER --api-secret $env:AMO_JWT_SECRET --artifacts-dir ff-signed
+            $signed = Get-ChildItem ff-signed -Filter *.xpi -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($signed) {
+              Copy-Item $signed.FullName dist/SwiftGet-firefox.xpi -Force
+              Write-Output "Firefox add-on signed by Mozilla"
+            } else {
+              Write-Output "::warning::Mozilla signing failed (each version can be signed once); using the unsigned add-on"
+            }
+          }
+          exit 0
+
+      # Code signing. If the repository has the secrets SIGN_PFX_BASE64 (a .pfx file encoded
+      # as base64) and SIGN_PFX_PASSWORD, that certificate is used. Otherwise a fresh
+      # self-signed "SwiftGet" certificate is made for this build; its private key only
+      # exists inside this job and is thrown away afterwards.
+      - name: Prepare code-signing certificate
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
+          if ($env:SIGN_PFX_BASE64) {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+            $pass = $env:SIGN_PFX_PASSWORD
+            Write-Output "Using the certificate from the repository secrets"
+          } else {
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=SwiftGet" `
+              -FriendlyName "SwiftGet" -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 `
+              -NotAfter (Get-Date).AddYears(5) -CertStoreLocation Cert:\CurrentUser\My
+            $pass = [guid]::NewGuid().ToString()
+            Export-PfxCertificate -Cert $cert -FilePath $pfx `
+              -Password (ConvertTo-SecureString $pass -AsPlainText -Force) | Out-Null
+            Export-Certificate -Cert $cert -FilePath SwiftGet-certificate.cer | Out-Null
+            Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -DeleteKey
+            Write-Output "Using a self-signed certificate (thumbprint $($cert.Thumbprint))"
+          }
+          Write-Output "::add-mask::$pass"
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -like "*\x64\*" } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "SIGN_PFX=$pfx" >> $env:GITHUB_ENV
+          "SIGN_PASSWORD=$pass" >> $env:GITHUB_ENV
+
+      - name: Sign SwiftGet.exe
+        run: |
+          & installer\sign.cmd dist\SwiftGet\SwiftGet.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and sign SwiftGet-Setup.exe (Inno Setup)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          $version = python -c "import swiftget; print(swiftget.VERSION)"
+          $sign = (Resolve-Path installer\sign.cmd).Path
+          & $iscc "/DMyAppVersion=$version" "/DSIGN" "/Sswiftsign=cmd /c $sign `$f" installer\swiftget.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check signatures
+        run: |
+          foreach ($f in "dist\SwiftGet\SwiftGet.exe", "dist-installer\SwiftGet-Setup.exe") {
+            $sig = Get-AuthenticodeSignature $f
+            if (-not $sig.SignerCertificate) { throw "$f is not signed" }
+            Write-Output "$f -> signed by $($sig.SignerCertificate.Subject) (status: $($sig.Status))"
+          }
+          Remove-Item $env:SIGN_PFX -Force
+
+      - name: Package portable version
+        run: |
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item -Recurse dist/SwiftGet portable/SwiftGet
+          Copy-Item -Recurse browser-extension portable/SwiftGet/browser-extension
+          New-Item -ItemType Directory -Force portable/SwiftGet/firefox | Out-Null
+          Copy-Item dist/SwiftGet-firefox.xpi portable/SwiftGet/firefox/
+          Copy-Item README.md portable/SwiftGet/
+          if (Test-Path SwiftGet-certificate.cer) { Copy-Item SwiftGet-certificate.cer dist-installer/ }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGet-Setup
+          path: dist-installer/
+
+      - name: Upload portable version
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGet-portable
+          path: portable
+
+      # Public download link that needs no GitHub login:
+      # https://github.com/<owner>/<repo>/releases/latest/download/SwiftGet-Setup.exe
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = python -c "import swiftget; print(swiftget.VERSION)"
+          $tag = "swiftget-v$version"
+          Compress-Archive -Path portable/SwiftGet -DestinationPath SwiftGet-portable.zip -Force
+          $files = @("dist-installer/SwiftGet-Setup.exe", "SwiftGet-portable.zip", "dist/SwiftGet-firefox.xpi")
+          $notes = @"
+          SwiftGet Download Manager $version
+
+          Install: download SwiftGet-Setup.exe, right-click > Properties > Unblock > OK, then run it and click Next > Install > Finish.
+          The welcome screen then shows how to add the browser extension (one time).
+          Firefox: use SwiftGet-firefox.xpi (see the README for the steps).
+
+          SwiftGet-portable.zip is the same app without installing.
+          "@
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag @files --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA `
+              --title "SwiftGet $version" --notes $notes --latest
+          }

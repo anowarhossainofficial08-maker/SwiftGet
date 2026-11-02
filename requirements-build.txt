@@ -1,0 +1,3 @@
+# The app itself only uses the Python standard library.
+# This is needed only to build SwiftGet.exe:
+pyinstaller>=6.0

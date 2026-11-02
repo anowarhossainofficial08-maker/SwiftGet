@@ -1,0 +1,6 @@
+# Optional extras (the app still runs without them):
+# modern Windows 11 style theme
+sv-ttk>=2.6
+# system-tray icon + notifications
+pystray>=0.19
+pillow>=10

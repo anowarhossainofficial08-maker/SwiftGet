@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 13px "Segoe UI", system-ui, sans-serif; margin: 0; padding: 14px; width: 250px; color: #222; }
+    h1 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+    h1 img { width: 20px; height: 20px; }
+    .status { padding: 6px 8px; border-radius: 6px; margin-bottom: 10px; }
+    .on { background: #e6f4ea; color: #1e6b34; }
+    .off { background: #fce8e6; color: #a50e0e; }
+    label { display: flex; align-items: center; gap: 6px; margin: 8px 0; }
+    input[type=number] { width: 80px; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <h1><img src="icons/icon48.png" alt="">SwiftGet</h1>
+  <div id="status" class="status">Checking...</div>
+  <label><input type="checkbox" id="intercept"> Catch downloads automatically</label>
+  <label>Port <input type="number" id="port" min="1024" max="65535"></label>
+  <small>Right-click a link &rarr; "Download with SwiftGet" works too.</small>
+  <script src="popup.js"></script>
+</body>
+</html>
